@@ -228,6 +228,7 @@ class _MTPVariant:
     max_drafts: int
     draft_p_min: float
     adaptive: bool = False
+    pld: str | None = None
 
 
 _OPTIMIZATION_SWEEP = (
@@ -243,6 +244,8 @@ _MTP_SWEEP = (
     _MTPVariant("two_drafts", 2, 0.0),
     _MTPVariant("two_drafts_p60", 2, 0.6),
     _MTPVariant("adaptive_two_drafts", 2, 0.0, True),
+    _MTPVariant("pld_two_drafts", 2, 0.0, pld="hybrid"),
+    _MTPVariant("pld_only", 2, 0.0, pld="only"),
 )
 
 
@@ -609,6 +612,10 @@ def _read_mtp_stats(llm) -> dict[str, Any] | None:
         "adaptive_window": worker.adaptive_window,
         "adaptive_probe_interval": worker.adaptive_probe_interval,
         "adaptive_controller": worker.adaptive_summary(),
+        "pld_mode": worker.pld_mode,
+        "pld_cycles": metrics.pld_cycles,
+        "pld_proposed_drafts": metrics.pld_proposed_drafts,
+        "pld_accepted_drafts": metrics.pld_accepted_drafts,
         "cycle_trace": list(metrics.cycle_trace),
         "cycle_trace_truncated": metrics.cycles > len(metrics.cycle_trace),
         "proposed_drafts": metrics.proposed_drafts,
@@ -760,6 +767,7 @@ def _run_mtp_sweep(
         worker.max_drafts,
         worker.draft_p_min,
         worker.adaptive_enabled,
+        worker.pld_mode,
     )
     variants = {}
     try:
@@ -767,6 +775,7 @@ def _run_mtp_sweep(
             worker.max_drafts = variant.max_drafts
             worker.draft_p_min = variant.draft_p_min
             worker.adaptive_enabled = variant.adaptive
+            worker.pld_mode = variant.pld
             print(f"MTP sweep: {variant.name} warmup ...", flush=True)
             _reset_mtp_stats(llm)
             warmup = _measure_generation(llm, prompt, warmup_tokens)
@@ -778,6 +787,7 @@ def _run_mtp_sweep(
                 "max_drafts": variant.max_drafts,
                 "draft_p_min": variant.draft_p_min,
                 "adaptive": variant.adaptive,
+                "pld": variant.pld,
                 "warmup": warmup,
                 "measured": measured,
                 "outputs_match_baseline": (
@@ -799,6 +809,7 @@ def _run_mtp_sweep(
             worker.max_drafts,
             worker.draft_p_min,
             worker.adaptive_enabled,
+            worker.pld_mode,
         ) = original
 
     return {

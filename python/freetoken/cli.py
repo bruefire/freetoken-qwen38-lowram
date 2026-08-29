@@ -69,6 +69,7 @@ Subcommands:
   bw              Benchmark CPU vs PCIe bandwidth and pick the MoE backend
   decode-profile  Profile offline decode (CUDA graph wall time + eager operator detail)
   ple-replay      Replay Qwen4-Exp PLE reads without loading the model
+  mtp-policy-replay  Simulate MTP draft policies over a recorded sweep report
 
 Use "ft bench <subcommand> --help" for subcommand-specific options.""",
         file=file,
@@ -95,6 +96,10 @@ def _run_bench(argv: list[str]) -> int:
         from freetoken.benchmark.ple_replay import main
 
         return main(argv[1:], prog="ft bench ple-replay")
+    if sub == "mtp-policy-replay":
+        from freetoken.benchmark.mtp_policy_replay import main
+
+        return main(argv[1:], prog="ft bench mtp-policy-replay")
     print(f"unknown ft bench subcommand: {sub}", file=sys.stderr)
     _print_bench_help(sys.stderr)
     return 2

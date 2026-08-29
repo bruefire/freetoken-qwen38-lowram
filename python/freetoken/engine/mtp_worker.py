@@ -15,6 +15,7 @@ import torch
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.attention.qsa_sparse import QSASparseAttnBackend, QSASparseMetadata
 from freetoken.core import Batch, Req
+from freetoken.pld_index import PLDIndex
 from freetoken.utils import decode_profile_range, init_logger
 
 from .graph import project_lm_head_all_positions
@@ -33,6 +34,9 @@ class MTPMetrics:
     proposed_drafts: int = 0
     accepted_drafts: int = 0
     emitted_tokens: int = 0
+    pld_cycles: int = 0
+    pld_proposed_drafts: int = 0
+    pld_accepted_drafts: int = 0
     cycle_trace: list[dict[str, int]] = field(default_factory=list)
 
     @property
@@ -64,6 +68,30 @@ def _mtp_draft_p_min() -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError("FREETOKEN_QWEN4_MTP_DRAFT_P_MIN must be between 0 and 1")
     return value
+
+
+def _mtp_pld_mode() -> str | None:
+    raw = os.getenv("FREETOKEN_QWEN4_MTP_PLD", "0").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return None
+    if raw in {"1", "true", "yes", "on", "hybrid"}:
+        return "hybrid"
+    if raw == "only":
+        return "only"
+    raise ValueError("FREETOKEN_QWEN4_MTP_PLD must be a boolean or 'only'")
+
+
+def _mtp_pld_ngram_range() -> tuple[int, int]:
+    raw_min = os.getenv("FREETOKEN_QWEN4_MTP_PLD_MIN_NGRAM", "6").strip()
+    raw_max = os.getenv("FREETOKEN_QWEN4_MTP_PLD_MAX_NGRAM", "12").strip()
+    try:
+        minimum = int(raw_min)
+        maximum = int(raw_max)
+    except ValueError as error:
+        raise ValueError("MTP PLD n-gram bounds must be integers") from error
+    if not 1 <= minimum <= maximum:
+        raise ValueError("MTP PLD needs 1 <= MIN_NGRAM <= MAX_NGRAM")
+    return minimum, maximum
 
 
 def _mtp_adaptive_enabled() -> bool:
@@ -781,6 +809,24 @@ class MTPWorker:
         self.adaptive_disabled_uid: int | None = None
         self.adaptive_decision_cycle: int | None = None
         self._adaptive_pending: list[_AdaptiveTimingSample] = []
+        self.pld_mode = _mtp_pld_mode()
+        self.pld_min_ngram, self.pld_max_ngram = _mtp_pld_ngram_range()
+        self.pld_index: PLDIndex | None = None
+        if self.pld_mode is not None and self.adaptive_enabled:
+            raise RuntimeError(
+                "adaptive MTP and FREETOKEN_QWEN4_MTP_PLD cannot be combined"
+            )
+        # Small persistent staging so a lookup draft is a pinned H2D copy, not
+        # a pageable blocking transfer. Allocated unconditionally: the sweep
+        # can switch pld_mode after construction.
+        self._pld_host_tokens = torch.empty(
+            self.max_supported_drafts,
+            dtype=torch.int32,
+            pin_memory=torch.cuda.is_available(),
+        )
+        self._pld_device_tokens = torch.empty(
+            self.max_supported_drafts, dtype=torch.int32, device=engine.device
+        )
         self.metrics = MTPMetrics()
         self.log_interval = max(
             0, int(os.getenv("FREETOKEN_QWEN4_MTP_LOG_INTERVAL", "40"))
@@ -822,6 +868,11 @@ class MTPWorker:
         self._adaptive_pending.clear()
         if self.adaptive_controller is not None:
             self.adaptive_controller.reset()
+        self.pld_index = (
+            PLDIndex(self.pld_min_ngram, self.pld_max_ngram)
+            if self.pld_mode is not None
+            else None
+        )
 
     def reset_metrics(self) -> None:
         self.metrics = MTPMetrics()
@@ -878,6 +929,10 @@ class MTPWorker:
             raise RuntimeError(
                 "adaptive MTP and FREETOKEN_QWEN4_MTP_DRAFT_P_MIN cannot be combined"
             )
+        if self.pld_mode is not None:
+            raise RuntimeError(
+                "adaptive MTP and FREETOKEN_QWEN4_MTP_PLD cannot be combined"
+            )
         controller = self.adaptive_controller
         previous = controller.selected_width
         width = controller.choose(max_width)
@@ -913,13 +968,20 @@ class MTPWorker:
         if not batch.is_decode or batch.size != 1:
             return False
         req = batch.reqs[0]
-        return (
+        if not (
             req.sampling_params.is_greedy
             and req.remain_len >= 2
             and self.adaptive_disabled_uid != req.uid
             and self.uid == req.uid
             and self.pending_hidden is None
-            and self.pending_draft is not None
+        ):
+            return False
+        if self.pld_mode == "only":
+            # Lookup-only drafting never advances the predictor after prefill,
+            # so predictor-state currency is not required.
+            return self.pld_index is not None
+        return (
+            self.pending_draft is not None
             and self.predictor_cached_len == req.cached_len
         )
 
@@ -990,6 +1052,13 @@ class MTPWorker:
                 if self.max_supported_drafts > 1:
                     self.pending_predictor_hidden = predictor_expanded[-1:].clone()
 
+        if final and self.pld_index is not None:
+            # One host sync at the end of prefill: the lookup context is the
+            # prompt plus the first generated token.
+            prompt_tokens = req.input_ids[:end].tolist()
+            prompt_tokens.append(int(base_token[0].item()))
+            self.pld_index.extend(prompt_tokens)
+
         self.pending_hidden = None if final else expanded_hidden[-1:].clone()
         expected_cached = end if final else max(0, end - 1)
         if self.predictor_cached_len != expected_cached:
@@ -1008,15 +1077,17 @@ class MTPWorker:
             self._finish_adaptive_wall(adaptive_wall_started)
             self._collect_adaptive_samples()
         source_position = req.cached_len
+        pld_only = self.pld_mode == "only"
         if self.pending_hidden is not None:
             raise RuntimeError("MTP prompt initialization is incomplete")
-        if self.pending_draft is None:
-            raise RuntimeError("MTP draft is not initialized")
-        if self.predictor_cached_len != source_position:
-            raise RuntimeError(
-                f"MTP predictor cache ends at {self.predictor_cached_len}, "
-                f"target decode starts at {source_position}"
-            )
+        if not pld_only:
+            if self.pending_draft is None:
+                raise RuntimeError("MTP draft is not initialized")
+            if self.predictor_cached_len != source_position:
+                raise RuntimeError(
+                    f"MTP predictor cache ends at {self.predictor_cached_len}, "
+                    f"target decode starts at {source_position}"
+                )
 
         max_drafts = min(
             self.max_drafts,
@@ -1035,7 +1106,19 @@ class MTPWorker:
             adaptive_cycle_started.record(self.engine.stream)
         draft_parts = []
         predictor_speculated = False
-        if max_drafts and self.pending_draft_confidence >= self.draft_p_min:
+        pld_draft_count = 0
+        if max_drafts and self.pld_index is not None:
+            with self._profile_phase("PLDLookup"):
+                pld_tokens = self.pld_index.draft(max_drafts)
+            if pld_tokens:
+                pld_draft_count = len(pld_tokens)
+                draft_parts.append(self._pld_draft_tensor(pld_tokens))
+        if (
+            not draft_parts
+            and not pld_only
+            and max_drafts
+            and self.pending_draft_confidence >= self.draft_p_min
+        ):
             draft_parts.append(self.pending_draft[:1])
             if max_drafts >= 2:
                 if self.pending_predictor_hidden is None:
@@ -1114,22 +1197,23 @@ class MTPWorker:
                         source_position,
                     )
 
-        if predictor_speculated:
-            self.predictor_cached_len = source_position
-        with self._profile_phase(f"PredictorCommit{output.numel()}"):
-            draft_logits, predictor_expanded = self._run_predictor(
-                batch,
-                req,
-                committed_expanded,
-                output,
-                source_position,
-            )
+        if not pld_only:
+            if predictor_speculated:
+                self.predictor_cached_len = source_position
+            with self._profile_phase(f"PredictorCommit{output.numel()}"):
+                draft_logits, predictor_expanded = self._run_predictor(
+                    batch,
+                    req,
+                    committed_expanded,
+                    output,
+                    source_position,
+                )
 
-        self.pending_draft, self.pending_draft_confidence = self._draft_candidate(
-            draft_logits
-        )
-        if self.max_supported_drafts > 1:
-            self.pending_predictor_hidden = predictor_expanded[-1:].clone()
+            self.pending_draft, self.pending_draft_confidence = self._draft_candidate(
+                draft_logits
+            )
+            if self.max_supported_drafts > 1:
+                self.pending_predictor_hidden = predictor_expanded[-1:].clone()
         if adaptive_cycle_started is not None and not disable_after_cycle:
             assert adaptive_target_started is not None
             assert adaptive_target_ended is not None
@@ -1153,12 +1237,21 @@ class MTPWorker:
                 "Qwen4-Exp MTP adaptive fallback: "
                 f"cycle={self.adaptive_decision_cycle}, ordinary decode selected"
             )
+        if self.pld_index is not None:
+            # The decision sync above already drained past verification, so
+            # this short D2H copy of the emitted tokens does not stall.
+            with self._profile_phase("PLDCommit"):
+                self.pld_index.extend(output.to(device="cpu").tolist())
         req.complete_one()
 
         self.metrics.cycles += 1
         self.metrics.proposed_drafts += draft_tokens.numel()
         self.metrics.accepted_drafts += accepted_count
         self.metrics.emitted_tokens += output.numel()
+        if pld_draft_count:
+            self.metrics.pld_cycles += 1
+            self.metrics.pld_proposed_drafts += pld_draft_count
+            self.metrics.pld_accepted_drafts += accepted_count
         if self.timing_enabled and len(self.metrics.cycle_trace) < 4096:
             self.metrics.cycle_trace.append(
                 {
@@ -1166,6 +1259,7 @@ class MTPWorker:
                     "width": draft_tokens.numel(),
                     "accepted": accepted_count,
                     "emitted": output.numel(),
+                    "pld": pld_draft_count,
                 }
             )
         if self.log_interval and self.metrics.cycles % self.log_interval == 0:
@@ -1178,6 +1272,15 @@ class MTPWorker:
                 f"tokens/cycle={self.metrics.emitted_tokens / self.metrics.cycles:.3f}"
             )
         return output, accepted_count == draft_tokens.numel()
+
+    def _pld_draft_tensor(self, tokens: list[int]) -> torch.Tensor:
+        count = len(tokens)
+        for index, token in enumerate(tokens):
+            self._pld_host_tokens[index] = token
+        self._pld_device_tokens[:count].copy_(
+            self._pld_host_tokens[:count], non_blocking=True
+        )
+        return self._pld_device_tokens[:count]
 
     def _draft_candidate(self, logits: torch.Tensor) -> tuple[torch.Tensor, float]:
         last = logits[-1]

@@ -96,6 +96,7 @@ def test_mtp_sweep_reuses_one_loaded_worker(monkeypatch) -> None:
         max_drafts = 2
         draft_p_min = 0.0
         adaptive_enabled = False
+        pld_mode = None
 
         def reset_metrics(self):
             pass
@@ -113,15 +114,18 @@ def test_mtp_sweep_reuses_one_loaded_worker(monkeypatch) -> None:
                 active.max_drafts,
                 active.draft_p_min,
                 active.adaptive_enabled,
+                active.pld_mode,
             )
         )
         calls.append((key, token_count))
         rate = {
             "baseline": 10.0,
-            (1, 0.0, False): 11.0,
-            (2, 0.0, False): 12.0,
-            (2, 0.6, False): 13.0,
-            (2, 0.0, True): 14.0,
+            (1, 0.0, False, None): 11.0,
+            (2, 0.0, False, None): 12.0,
+            (2, 0.6, False, None): 13.0,
+            (2, 0.0, True, None): 14.0,
+            (2, 0.0, False, "hybrid"): 15.0,
+            (2, 0.0, False, "only"): 16.0,
         }[key]
         return {
             "timing": {"decode_output_tokens_per_second": rate},
@@ -134,16 +138,19 @@ def test_mtp_sweep_reuses_one_loaded_worker(monkeypatch) -> None:
 
     result = _run_mtp_sweep(llm, [1], warmup_tokens=2, benchmark_tokens=3)
 
-    assert len(calls) == 10
+    assert len(calls) == 14
     assert result["variants"]["one_draft"]["speedup"] == pytest.approx(1.1)
     assert result["variants"]["two_drafts"]["speedup"] == pytest.approx(1.2)
     assert result["variants"]["two_drafts_p60"]["speedup"] == pytest.approx(1.3)
     assert result["variants"]["adaptive_two_drafts"]["speedup"] == pytest.approx(1.4)
-    assert (worker.max_drafts, worker.draft_p_min, worker.adaptive_enabled) == (
-        2,
-        0.0,
-        False,
-    )
+    assert result["variants"]["pld_two_drafts"]["speedup"] == pytest.approx(1.5)
+    assert result["variants"]["pld_only"]["speedup"] == pytest.approx(1.6)
+    assert (
+        worker.max_drafts,
+        worker.draft_p_min,
+        worker.adaptive_enabled,
+        worker.pld_mode,
+    ) == (2, 0.0, False, None)
 
 
 def test_mtp_stats_include_cost_aware_controller_state() -> None:
@@ -173,6 +180,7 @@ def test_mtp_stats_include_cost_aware_controller_state() -> None:
         adaptive_samples=8,
         adaptive_window=64,
         adaptive_probe_interval=16,
+        pld_mode=None,
         uid=7,
         adaptive_summary=lambda: controller,
         timing=dict,

@@ -16,8 +16,11 @@ from freetoken.engine.mtp_worker import (
     _mtp_adaptive_window,
     _mtp_draft_p_min,
     _mtp_max_drafts,
+    _mtp_pld_mode,
+    _mtp_pld_ngram_range,
     choose_adaptive_draft_width,
 )
+from freetoken.pld_index import PLDIndex
 
 
 def _req(tokens: list[int]) -> Req:
@@ -77,6 +80,22 @@ def test_mtp_draft_environment_is_validated(monkeypatch):
     with pytest.raises(ValueError, match="must be positive"):
         _mtp_adaptive_probe_interval()
 
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD", "only")
+    assert _mtp_pld_mode() == "only"
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD", "1")
+    assert _mtp_pld_mode() == "hybrid"
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD", "off")
+    assert _mtp_pld_mode() is None
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD", "sometimes")
+    with pytest.raises(ValueError, match="boolean or 'only'"):
+        _mtp_pld_mode()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD_MIN_NGRAM", "4")
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD_MAX_NGRAM", "8")
+    assert _mtp_pld_ngram_range() == (4, 8)
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_PLD_MIN_NGRAM", "0")
+    with pytest.raises(ValueError, match="MIN_NGRAM"):
+        _mtp_pld_ngram_range()
+
 
 def test_mtp_can_speculate_only_for_initialized_single_request():
     req = _req([10, 11, 12])
@@ -88,6 +107,7 @@ def test_mtp_can_speculate_only_for_initialized_single_request():
     worker.pending_hidden = None
     worker.pending_draft = torch.tensor([7], dtype=torch.int32)
     worker.adaptive_disabled_uid = None
+    worker.pld_mode = None
 
     assert worker.can_speculate(batch)
 
@@ -115,6 +135,7 @@ def test_mtp_prefill_keeps_hidden_and_next_token_alignment_across_chunks():
     worker.draft_p_min = 0.0
     worker.adaptive_controller = None
     worker._adaptive_pending = []
+    worker.pld_mode = None
     calls = []
 
     def run_predictor(self, batch, req, hidden, token_ids, source_start):
@@ -202,9 +223,18 @@ def _decode_worker(
         proposed_drafts=0,
         accepted_drafts=0,
         emitted_tokens=0,
+        pld_cycles=0,
+        pld_proposed_drafts=0,
+        pld_accepted_drafts=0,
         acceptance_rate=0.0,
         cycle_trace=[],
     )
+    worker.pld_mode = None
+    worker.pld_index = None
+    worker.pld_min_ngram = 2
+    worker.pld_max_ngram = 4
+    worker._pld_host_tokens = torch.empty(max_drafts, dtype=torch.int32)
+    worker._pld_device_tokens = torch.empty(max_drafts, dtype=torch.int32)
     worker.log_interval = 0
     worker.timing_enabled = False
     worker.timing_events = []
@@ -436,6 +466,196 @@ def test_mtp_second_draft_confidence_gate_verifies_only_first_draft():
     assert predictors[1][2].tolist() == [7, 9]
     assert not prefix_commits
     assert worker.metrics.proposed_drafts == 1
+
+
+def test_mtp_pld_draft_wins_over_predictor_chain():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, extensions, predictors, prefix_commits = _decode_worker(req, [7, 9])
+    worker.pld_mode = "hybrid"
+    index = PLDIndex(2, 4)
+    index.extend([5, 12, 7, 6, 5, 12])  # suffix [5, 12] continued with 7
+    worker.pld_index = index
+    worker.pending_draft = torch.tensor([6], dtype=torch.int32)  # would miss
+
+    output, accepted = worker.forward_decode(batch, SimpleNamespace())
+
+    assert accepted
+    assert output.tolist() == [7, 9]
+    assert extensions[0][1].tolist() == [12, 7]
+    assert not prefix_commits
+    # Only the commit ran; no recursive draft forward for the lookup draft.
+    assert len(predictors) == 1
+    assert predictors[0][2].tolist() == [7, 9]
+    assert worker.metrics.pld_cycles == 1
+    assert worker.metrics.pld_proposed_drafts == 1
+    assert worker.metrics.pld_accepted_drafts == 1
+    assert index.tokens[-2:] == [7, 9]
+
+
+def test_mtp_pld_hybrid_uses_predictor_draft_on_lookup_miss():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, extensions, predictors, prefix_commits = _decode_worker(req, [7, 9])
+    worker.pld_mode = "hybrid"
+    worker.pld_index = PLDIndex(2, 4)  # empty: no lookup match
+
+    output, accepted = worker.forward_decode(batch, SimpleNamespace())
+
+    assert accepted
+    assert output.tolist() == [7, 9]
+    assert extensions[0][1].tolist() == [12, 7]
+    assert len(predictors) == 1
+    assert not prefix_commits
+    assert worker.metrics.pld_cycles == 0
+    assert worker.metrics.proposed_drafts == 1
+    assert worker.pld_index.tokens == [7, 9]
+
+
+def test_mtp_pld_only_skips_predictor_and_survives_stale_state():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, extensions, predictors, prefix_commits = _decode_worker(req, [8])
+    worker.pld_mode = "only"
+    worker.pld_index = PLDIndex(2, 4)  # empty: ordinary single-token cycle
+    worker.pending_draft = None
+    worker.predictor_cached_len = 123  # stale predictor state is irrelevant
+
+    output, accepted = worker.forward_decode(batch, SimpleNamespace())
+
+    assert accepted
+    assert output.tolist() == [8]
+    assert extensions[0][1].tolist() == [12]
+    assert not predictors
+    assert not prefix_commits
+    assert worker.metrics.proposed_drafts == 0
+    assert worker.pld_index.tokens == [8]
+
+
+def test_mtp_pld_only_drafts_from_lookup():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, extensions, predictors, prefix_commits = _decode_worker(req, [7, 9])
+    worker.pld_mode = "only"
+    index = PLDIndex(2, 4)
+    index.extend([5, 12, 7, 6, 5, 12])
+    worker.pld_index = index
+    worker.pending_draft = None
+
+    output, accepted = worker.forward_decode(batch, SimpleNamespace())
+
+    assert accepted
+    assert output.tolist() == [7, 9]
+    assert extensions[0][1].tolist() == [12, 7]
+    assert not predictors
+    assert not prefix_commits
+    assert worker.metrics.pld_cycles == 1
+    assert worker.metrics.pld_accepted_drafts == 1
+    assert index.tokens[-2:] == [7, 9]
+
+
+def test_mtp_pld_rejected_lookup_draft_commits_prefix():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, extensions, predictors, prefix_commits = _decode_worker(req, [8, 9])
+    worker.pld_mode = "only"
+    index = PLDIndex(2, 4)
+    index.extend([5, 12, 7, 6, 5, 12])  # proposes 7; target wants 8
+    worker.pld_index = index
+    worker.pending_draft = None
+
+    output, accepted = worker.forward_decode(batch, SimpleNamespace())
+
+    assert not accepted
+    assert output.tolist() == [8]
+    assert extensions[0][1].tolist() == [12, 7]
+    assert not predictors
+    assert prefix_commits == [(req, 0)]
+    assert worker.metrics.pld_proposed_drafts == 1
+    assert worker.metrics.pld_accepted_drafts == 0
+    assert index.tokens[-1:] == [8]
+
+
+def test_mtp_pld_only_can_speculate_without_predictor_state():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    worker = object.__new__(MTPWorker)
+    worker.uid = req.uid
+    worker.pending_hidden = None
+    worker.pending_draft = None
+    worker.predictor_cached_len = 0
+    worker.adaptive_disabled_uid = None
+    worker.pld_mode = "only"
+    worker.pld_index = PLDIndex(2, 4)
+
+    assert worker.can_speculate(batch)
+
+    worker.pld_index = None
+    assert not worker.can_speculate(batch)
+
+
+def test_mtp_pld_prefill_seeds_index_with_prompt_and_base_token():
+    worker = object.__new__(MTPWorker)
+    worker.engine = SimpleNamespace(device=torch.device("cpu"))
+    worker.uid = None
+    worker.predictor_cached_len = 0
+    worker.pending_hidden = None
+    worker.pending_draft = None
+    worker.pending_predictor_hidden = None
+    worker.max_supported_drafts = 1
+    worker.max_drafts = 1
+    worker.draft_p_min = 0.0
+    worker.adaptive_controller = None
+    worker._adaptive_pending = []
+    worker.pld_mode = "hybrid"
+    worker.pld_min_ngram = 2
+    worker.pld_max_ngram = 4
+
+    def run_predictor(self, batch, req, hidden, token_ids, source_start):
+        self.predictor_cached_len += token_ids.numel()
+        return torch.zeros(token_ids.numel(), 4), hidden
+
+    worker._run_predictor = MethodType(run_predictor, worker)
+    req = _req([10, 11, 12])
+    batch = Batch(reqs=[req], phase="prefill")
+    worker.update_prefill(
+        batch,
+        torch.tensor([[0.0], [1.0], [2.0]]),
+        torch.tensor([99], dtype=torch.int32),
+        start=0,
+        end=3,
+        final=True,
+    )
+
+    assert worker.pld_index is not None
+    assert worker.pld_index.tokens == [10, 11, 12, 99]
+
+
+def test_mtp_pld_and_adaptive_cannot_be_combined():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, _extensions, _predictors, _prefix_commits = _decode_worker(req, [7, 9])
+    worker.pld_mode = "hybrid"
+    worker.pld_index = PLDIndex(2, 4)
+    worker.adaptive_enabled = True
+    worker.adaptive_controller = None
+    worker._adaptive_pending = []
+
+    with pytest.raises(RuntimeError, match="cannot be combined"):
+        worker.forward_decode(batch, SimpleNamespace())
 
 
 def test_mtp_tail_limit_does_not_change_adaptive_policy_width():
